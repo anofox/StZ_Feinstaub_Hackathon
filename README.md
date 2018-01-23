@@ -4,7 +4,7 @@ Ergebnisse der Datenanalyse vom Feinstaub Hackathon 2018 der Stuttgarter Zeitung
 
 ## Der schnelle Weg zu den Ergebnissen 
 
-Sie finden unseren detailierteren Bericht zur Sensor-Datenqualität unter  [Datenqualitäts - Report](Datenqualität_-_KPI.html). Alternativ downloaden Sie die Datei Datenqualität_-_KPI.html.
+Sie finden unseren detailierteren Bericht zur Sensor-Datenqualität unter  [Datenqualitäts - Report](http://rpubs.com/anofox/feinstaub-hackathon). Alternativ downloaden Sie die Datei Datenqualität_-_KPI.html.
 
 ## Interaktive Applikation 
 
