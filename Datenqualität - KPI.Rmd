@@ -1,0 +1,480 @@
+---
+title: "Datenqualität - KPI"
+author: "Joachim Roßkopf & Dr. Simon Müller"
+date: "20. Januar 2018"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: readable
+    highlight: tango
+    css: kable.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(ggplot2)
+library(dplyr)
+
+# load dwd data 
+dwdTemperature <- fst::read_fst("data/temperatureData.fst") %>% 
+  as.data.table()
+dwdStations <- fst::read_fst("../LuftinfoApp/data/dwdStations.fst") %>% 
+  as.data.table()
+
+# load sensor data
+sensors <- fst::read_fst("../LuftinfoApp/data/sensors_stgt_with_dwd.fst") %>% 
+  as.data.table()
+sensorData <- fst::read_fst("../LuftinfoApp/data/shiny_heuristic_luft_stgt.fst") %>% 
+  as.data.table()
+
+sensorData %>% 
+  dplyr::filter(variable == "temperature") %>% 
+  dplyr::select(sensor_id, timestamp, value) %>% 
+  data.table::as.data.table() -> sensorDataTemp
+sensors %>% 
+  dplyr::select(sensor_id, closestTemp) -> sensorsTemp
+# add closest dwd station id
+sensorDataTemp %>% 
+  dplyr::left_join(sensorsTemp, "sensor_id") %>% 
+  dplyr::rename(dwd_id = closestTemp) %>% 
+  data.table::as.data.table() -> sensorDataTemp
+# add dwd temperature data
+dwdTemperature %>% 
+  dplyr::select(STATIONS_ID, TT_TU, date) %>% 
+  data.table::as.data.table() -> dwdTemperature
+setnames(dwdTemperature, c("STATIONS_ID", "date"), c("dwd_id", "timestamp"))
+sensorDataTemp %>% 
+  dplyr::filter(!is.na(dwd_id)) %>% 
+  dplyr::left_join(dwdTemperature, c("dwd_id", "timestamp")) %>% 
+  data.table::as.data.table() -> sensorDataTemp
+```
+
+# Vorbemerkung 
+
+Diese Analyse ist das Resultat des Hackathon vom 20.01.2018 und hat nicht den Anspruch final oder vollständig zu sein. Je nach freier Kapazität und Bedarf durch das OK Lab können und werden die hier angerissenen Ideen finaliserit bzw. erweitert.
+
+
+# Motivation für Hackathon
+
+Siehe Folien oder die gute Aufbereitung der zweiten Datenqualitätsgruppe.
+
+# Datenqualität
+
+## Temperatur
+
+Für jede Lokalisation verwenden wir die nächste DWD Wetterstation als Referenzstation für die KPI-Berechnung. 
+**Die Idee**: Betrachte die Daten der vergangenen Woche bzw. des vergangenen Tags und berechne die hier entwickelte KPI, sollte eine große Abweichung vorliegen, sende dem Nutzer per SMS/EMail eine Warnmeldung und/oder markiere diesen Sensor auffällig.
+
+
+### Vorverarbeitung
+
+Berechne zunächst die Differenz zur DWD-Messtation:
+
+$$
+score_i = \sqrt{\frac{1}{n}\sum (y_i - y_{dwd})^2}
+$$
+
+
+```{r, warning=FALSE, message=FALSE}
+sensorDataTemp[TT_TU == -999, TT_TU := NA]
+sensorDataTemp[, diff := value - TT_TU] 
+# sensorDataTemp[, diff := abs(((value + 30) - (TT_TU + 30)) / (TT_TU + 30))] # MAPE
+```
+
+Füge einige später nutzbare Spalten hinzu und definiere letzte Woche und heute.
+
+```{r, warning=FALSE, message=FALSE}
+today <- as.Date("2018-01-01")
+oneWeek <- seq(today - lubridate::days(6), today, by = 1)
+sensorDataTemp[, `:=`(week = data.table::week(timestamp), 
+                      year = data.table::year(timestamp),
+                      dayOfYear = data.table::yday(timestamp))]
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+oneWeekData <- sensorDataTemp[as.Date(timestamp) %in% oneWeek]
+todayData <- sensorDataTemp[as.Date(timestamp) %in% today]
+```
+
+Berechne für jeden Sensor den Mittelwert über den Referenzzeitraum:
+
+```{r, warning=FALSE, message=FALSE}
+oneWeekAgg <- oneWeekData[, lapply(.SD, mean, na.rm=T), .SDcols = "diff", by = "sensor_id"]
+todayAgg <- todayData[, lapply(.SD, mean, na.rm=T), .SDcols = "diff", by = "sensor_id"]
+```
+
+```{r, out.width="100%", out.height="75%", fig.height=4, fig.width=8, warning=FALSE, message=FALSE}
+pWeek <- ggplot(oneWeekAgg) +
+  geom_histogram(aes(x = diff), fill="steelblue", color="white", bins = 50) + 
+  theme_bw() +ylab("") +xlab("mittlere Abweichung") + ggtitle("Woche")
+pDay <- ggplot(todayAgg) +
+  geom_histogram(aes(x = diff), fill="steelblue", color="white", bins = 50) + 
+  theme_bw() +ylab("") +xlab("mittlere Abweichung") + ggtitle("Tag")
+plotly::subplot(pWeek, pDay)
+```
+
+Die mittlere Abweichung ist in beiden Fällen positiv. Vermutlich liegt das daran, daß die Sensoren in der Regel in der Stadt liegen. Daher werden die mittleren Abweichungen standardisiert.
+
+**TODO:** Überprüfe die Lage der DWD-Stationen.
+
+```{r, warning=FALSE, message=FALSE}
+oneWeekAgg[, diff := (diff - mean(diff, na.rm=T)) / sd(diff, na.rm=T)]
+todayAgg[, diff := (diff - mean(diff, na.rm=T)) / sd(diff, na.rm=T)]
+```
+
+```{r, warning=FALSE, message=FALSE}
+dfDensity <- data.frame(diff = rnorm(n = 1e6))
+pWeek <- ggplot(oneWeekAgg) +
+  geom_histogram(aes(x = diff, y = ..density..), fill="steelblue", color="white", bins = 50) + 
+  geom_density(data = dfDensity, aes(x = diff), colour = "red3") +
+  theme_bw() +ylab("") +xlab("mittlere Abweichung") + ggtitle("Woche")
+plotly::ggplotly(pWeek)
+```
+
+### KPI
+
+Es wird angenommen, daß diese mittler Abweichung normalverteilt ist. Daher verwenden wir als KPI die Wahrscheinlichkeit basierend auf dieser Annahme.
+
+```{r, warning=FALSE, message=FALSE}
+oneWeekAgg[, p := 2 * pnorm(diff) - 1]
+todayAgg[, p := 2 * pnorm(diff) - 1]
+oneWeekAgg %>% 
+  dplyr::arrange(-p) -> oneWeekAgg
+todayAgg %>% 
+  dplyr::arrange(-p) -> todayAgg
+oneWeekAgg %>% 
+  DT::datatable(rownames  = F, 
+                selection = "single",
+                options   = list(dom = 't')) %>% 
+  DT::formatRound(columns = 2:3)
+```
+
+Entsprechend werden folgende Warnstufen erstellt:
+
+- 1 SD Abweichung: Gelb
+- 2 SD Abweichung: Orange
+- 3 SD Abweichung: Rot
+
+```{r, warning=FALSE, message=FALSE}
+getWarn <- function(x) {
+  breaks <- 2 * c(0, pnorm(1), pnorm(2), pnorm(3), Inf) - 1
+  cut(abs(x), breaks = breaks, include.lowest = T, labels = c("Grün", "Gelb", "Orange", "Rot"))
+}
+oneWeekAgg %>% 
+  dplyr::mutate(Warnstufe = getWarn(p)) -> oneWeekAgg
+todayAgg %>% 
+  dplyr::mutate(Warnstufe = getWarn(p)) -> todayAgg
+oneWeekAgg %>% 
+  DT::datatable(rownames  = F, 
+                selection = "single",
+                options   = list(dom = 't')) %>% 
+  DT::formatRound(columns = 2:3)
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+oneWeekAgg %>% 
+  group_by(Warnstufe) %>% 
+  count() %>% 
+  DT::datatable(rownames  = F, 
+                selection = "single",
+                options   = list(dom = 't'))
+```
+
+Betrachten wir mal die Sensoren mit roter Warnstufe mal genauer an:
+
+```{r, out.width="100%", out.height="75%", warning=FALSE, message=FALSE}
+oneWeekAgg %>% 
+  dplyr::filter(Warnstufe == "Rot") -> worstSensors
+
+oneWeekData %>% 
+  dplyr::filter(sensor_id %in% worstSensors$sensor_id) %>% 
+  dplyr::mutate(sensor_id = factor(sensor_id)) -> worstSensorsData
+
+worstSensorsData %>% 
+  dplyr::select(timestamp, dwd_id, TT_TU) %>% 
+  unique() %>% 
+  dplyr::mutate(dwd_id = factor(dwd_id)) -> dwdData
+
+p <- ggplot(worstSensorsData) +
+  geom_line(aes(x = timestamp, y = value, color = sensor_id)) +
+  ggpubr::color_palette(name = "sensor_id", palette = "jco") +
+  geom_line(data = dwdData, aes(x = timestamp, y = TT_TU, linetype = dwd_id)) + 
+  theme_bw() +
+  theme(legend.position = "top") + xlab("Zeit") + ylab("°C")
+plotly::ggplotly(p)
+```
+
+Betrachten wir nun die Sensoren mit Warnstufe Gelb an:
+
+```{r, out.width="100%", out.height="75%", warning=FALSE, message=FALSE}
+oneWeekAgg %>% 
+  dplyr::filter(Warnstufe == "Gelb") -> worstSensors
+
+oneWeekData %>% 
+  dplyr::filter(sensor_id %in% worstSensors$sensor_id) %>% 
+  dplyr::mutate(sensor_id = factor(sensor_id)) -> worstSensorsData
+
+worstSensorsData %>% 
+  dplyr::select(timestamp, dwd_id, TT_TU) %>% 
+  unique() %>% 
+  dplyr::mutate(dwd_id = factor(dwd_id)) -> dwdData
+
+p <- ggplot(worstSensorsData) +
+  geom_line(aes(x = timestamp, y = value, color = sensor_id)) +
+  ggpubr::color_palette(name = "sensor_id", palette = "jco") +
+  geom_line(data = dwdData, aes(x = timestamp, y = TT_TU, linetype = dwd_id)) + 
+  theme_bw() +
+  theme(legend.position = "top") + xlab("Zeit") + ylab("°C")
+plotly::ggplotly(p)
+```
+
+und abschließend ein Subsample der Wanrstufe Grün (15 Sensoren zufällig ausgewählt):
+
+```{r, out.width="100%", out.height="75%", warning=FALSE, message=FALSE}
+oneWeekAgg %>% 
+  dplyr::filter(Warnstufe == "Grün") %>% 
+  dplyr::sample_n(size = 15) -> worstSensors
+
+oneWeekData %>% 
+  dplyr::filter(sensor_id %in% worstSensors$sensor_id) %>% 
+  dplyr::mutate(sensor_id = factor(sensor_id)) -> worstSensorsData
+
+worstSensorsData %>% 
+  dplyr::select(timestamp, dwd_id, TT_TU) %>% 
+  unique() %>% 
+  dplyr::mutate(dwd_id = factor(dwd_id)) -> dwdData
+
+p <- ggplot(worstSensorsData) +
+  geom_line(aes(x = timestamp, y = value, color = sensor_id)) +
+  ggpubr::color_palette(name = "sensor_id", palette = "jco") +
+  geom_line(data = dwdData, aes(x = timestamp, y = TT_TU, linetype = dwd_id)) + 
+  theme_bw() +
+  theme(legend.position = "top") + xlab("Zeit") + ylab("°C")
+plotly::ggplotly(p)
+```
+
+### Fazit
+
+Die vorgestellte Methode scheint ein adequates Maß für die Güte der Temperatur Sensoren zu sein. Bei den als Gelb markierten Sensoren scheint es einige Sensoren mit hoher Güte (wenn man den Verlauf betrachtet) zu geben. Diese sind lediglich um einige Grad Celsius verschoben. Die Ursache könnte unter anderem daran liegen, daß die Umgebung generel wärmer ist. Des Weiteren sind bei den Gelb bzw. Grün markierten Sensoren einige Spitzen erkennbar. In der abschließenden Diskussion hatte sich herausgestellt, daß dies wohl der Einfluß der Sonne ist. 
+
+**Annahme**: Vermutlich funktioniert dieser Ansatz besser, wenn das Zeitfenster auf einen Tag festgelegt wird. Das wäre noch zu überprüfen.
+
+
+#### Alternative
+
+1. Passe für jeden Sensor eine Regressionskurve an, berechne die erste / zweite Ableitung und berechne dann den L2-Abstand zu den Referenzdaten. Diesen Ansatz hatte ich in meiner Dissertation untersucht.
+
+2. Verwende zusätzlich die k-nächsten Nachbarn (basierend auf den Geokoordinaten) und berechne bzgl. dieser den mittleren Abstand (Schränke den maximalen Abstand ein). Gewichte nun den Abstand zu den DWD-Daten und zu den k-NN-Daten. Die Gewichte könnte man durch den Abstand der Sensoren ermitteln, sowie dem DWD-Sensor ein höheres Gewicht aufgrund der hohen Verläßlichkeit geben. Hierdurch könnte berücksichtigt werden, daß bestimmte Gebiete wärmer sind. 
+
+3. Verwende zusätzlich Zeitreihen-Kennzahlen für die Ähnlichkeitsbestimmung der Zeitreihen (Paper von Hyndman) und berechne dann daraus den PCA-Score (wie Cut-Off wählen?). Dieser Ansatz wäre mehr Data Mining und weniger Statistik lastig.
+
+#### Anwendung
+
+1. Man den Betreiber des Sensors darauf hinweisen, daß Probleme mit dem Sensor vorliegen und dieser entweder anders platziert oder ausgetauscht werden muss.
+
+2. Nutzer der Daten können für weitergehende Analysen vorfiltern und nur Sensordaten mit hoher Güte ohne großen Aufwand auswählen.
+
+#### Hypothese
+
+An einem Standort sind teils mehrere Sensoren verbaut. Sollte die Ursache der schlechten Datenqualität des Temperatursensors an der Lage liegen, so könnte die Qualität der anderen Senoren ebenso schlecht sein. 
+
+
+## Sensoren ohne Referenz
+
+Hier wird der in 2. und 3. Ansatz (sieh Überschrift Alternativen) betrachtet.
+
+### Zeitreihen-Kennzahlen
+
+In einer Voranalyse hat sich gezeigt, daß dieser Ansatz nur bedingt funktioniert, wenn man die gesamte Zeitreihe betrachtet. Daher und da man auch an der Aktualität der der Güte interessiert ist, wird nur der gerade zurückliegende Zeitraum betrachtet. Dieser Ansatz ließe sich auch dahingehend erweitern, daß man Zeitfenster mit schlechter Güte ermittelt und diese "herausschneidet". Betrachten wir im folgenden die Daten der letzten Woche und P1-Daten.
+
+
+```{r, warning=FALSE, message=FALSE}
+fst::read_fst("../LuftinfoApp/data/shiny_heuristic_luft_stgt.fst") %>% 
+  dplyr::filter(variable == "P1") %>% 
+  dplyr::select(timestamp, value, sensor_id, location, lon, lat) %>% 
+  na.omit() %>% 
+  as.data.table() -> p1Data
+p1Data <- p1Data[as.Date(timestamp) %in% oneWeek]
+p1Data[, n:=.N, by=sensor_id]
+
+# use just sensors with at least 5 days of data
+p1Data <- p1Data[n > 5 * 24]
+p1Data[, n := NULL]
+```
+
+```{r, warning=FALSE, message=FALSE}
+library(tsfeatures)
+p1Data %>% 
+  dplyr::group_by(location, sensor_id) %>% 
+  dplyr::summarise(
+    mw              = mean(value, na.rm = T),
+    sd              = sd(value, na.rm = T),
+    entropy         = entropy(value),
+    crossing_points = crossing_points(value),
+    flat_spots      = flat_spots(value),
+    acf1            = acf_features(value)[1],
+    lumpiness       = lumpiness(value, 3),
+    stability       = stability(value, 3),
+    max_kl_shift    = max_kl_shift(value, 3)[1],
+    max_kl_index    = max_kl_shift(value, 3)[2],
+    max_level_shift = max_level_shift(value, 3)[1],
+    max_level_index = max_level_shift(value, 3)[2],
+    max_var_shift   = max_var_shift(value, 3)[1],
+    max_var_index   = max_var_shift(value, 3)[2]
+  ) %>% 
+  dplyr::ungroup() -> p1KPI
+
+p1KPI %>% 
+  DT::datatable(rownames  = F, 
+                selection = "single",
+                options   = list(dom     = 't',
+                                 scrollX = T)) %>% 
+  DT::formatRound(columns = c(3:5, 8:16))
+```
+
+
+```{r, out.width="100%", out.height="75%", fig.height=4, fig.width=8, warning=FALSE, message=FALSE}
+library(factoextra)
+library(FactoMineR)
+p1KPI %>% 
+  dplyr::select(-location, -sensor_id) %>% 
+  as.matrix() -> p1PCAData
+rownames(p1PCAData) <- p1KPI$sensor_id
+pcaOutput <- FactoMineR::PCA(p1PCAData, scale.unit = T, graph=F)
+ax12 <- fviz_pca_biplot(pcaOutput, col.ind = "steelblue", col.var = "black", pointshape = 21, axes = c(1, 2), pointsize = 2.5, alpha.ind=0.5) +
+  scale_color_manual(values = "steelblue")
+ax23 <- fviz_pca_biplot(pcaOutput, col.ind = "steelblue", col.var = "black", pointshape = 21, axes = c(2, 3), pointsize = 2.5, alpha.ind=0.5) +
+  scale_color_manual(values = "steelblue")
+cowplot::plot_grid(ax12, ax23)
+```
+
+Interpretation:
+
+- stability und lumpine sind gegenläufig, d.h. wir haben bei einigen Zeitreihen eine hohe Variabilität des Mittelwerts und gleichzeitig eine geringe Variabilität der Varianz. Betrachten wir nun einige Cluster.
+
+Sensor 1420 sticht hierbei besonders hervor:
+
+```{r, out.width="100%", out.height="75%", fig.height=4, fig.width=8, warning=FALSE, message=FALSE}
+p <- p1Data %>% 
+  dplyr::filter(sensor_id == 1420) %>% 
+  dplyr::mutate(sensor_id = factor(sensor_id)) %>% 
+  ggplot() +
+  geom_line(aes(x = timestamp, y = value, color = sensor_id)) +
+  ggpubr::color_palette(name = "sensor_id", palette = "jco") +
+  theme_bw() +
+  theme(legend.position = "top") + xlab("Zeit") + ylab("P1")
+plotly::ggplotly(p)
+```
+
+Der Sensor liefert einen konstant hohen Wert. Schauen wir uns noch weitere an:
+
+```{r, out.width="100%", out.height="75%", fig.height=4, fig.width=8, warning=FALSE, message=FALSE}
+p <- p1Data %>% 
+  dplyr::filter(sensor_id == c(1352, 6588, 1739, 50, 727)) %>% 
+  dplyr::mutate(sensor_id = factor(sensor_id)) %>% 
+  ggplot() +
+  geom_line(aes(x = timestamp, y = value, color = sensor_id)) +
+  ggpubr::color_palette(name = "sensor_id", palette = "jco") +
+  theme_bw() +
+  theme(legend.position = "top") + xlab("Zeit") + ylab("P1")
+plotly::ggplotly(p)
+```
+
+Und die Gruppe rechts oben:
+
+
+```{r, out.width="100%", out.height="75%", fig.height=4, fig.width=8, warning=FALSE, message=FALSE}
+p <- p1Data %>% 
+  dplyr::filter(sensor_id == c(5399, 309, 209, 813, 193)) %>% 
+  dplyr::mutate(sensor_id = factor(sensor_id)) %>% 
+  ggplot() +
+  geom_line(aes(x = timestamp, y = value, color = sensor_id)) +
+  ggpubr::color_palette(name = "sensor_id", palette = "jco") +
+  theme_bw() +
+  theme(legend.position = "top") + xlab("Zeit") + ylab("P1") 
+plotly::ggplotly(p)
+```
+
+Berechnen wir nun den PCA-Score um eine Kennzahl zu bestimmen.
+
+```{r, warning=FALSE, message=FALSE}
+p1PCADataNA <- na.omit(p1PCAData)
+pc <- prcomp(p1PCADataNA, scale. = T)
+# just dim 1 & 2
+score <- rowSums((as.matrix(p1PCADataNA - pc$center) %*% pc$rotation[, 1:2])^2 / pc$sdev[1:2]^2)
+dfScore <- data.table(sensor_id = rownames(p1PCADataNA), score = score)
+dfScore[, score := (score - mean(score)) / sd(score)]
+
+getWarn <- function(x) {
+  breaks <- 2 * c(0, pnorm(1), pnorm(2), pnorm(3), Inf) - 1
+  cut(abs(x), breaks = breaks, include.lowest = T, labels = c("Grün", "Gelb", "Orange", "Rot"))
+}
+dfScore[, p := 2 * pnorm(score) - 1]
+dfScore[, Warnstufe := getWarn(p)]
+
+dfScore %>% 
+  group_by(Warnstufe) %>% 
+  count() %>% 
+  DT::datatable(rownames  = F, 
+                selection = "single",
+                options   = list(dom = 't'))
+```
+
+Schauen wir mal die Sensoren mit roter Warnstufe mal an. Das Resultat schein ein wenig zu optimistisch.
+
+```{r, out.width="100%", out.height="75%", warning=FALSE, message=FALSE}
+dfScore %>% 
+  dplyr::filter(Warnstufe %in% c("Rot", "Orange", "Gelb")) -> worstSensors
+
+p1Data %>% 
+  dplyr::filter(sensor_id %in% worstSensors$sensor_id) %>% 
+  dplyr::mutate(sensor_id = factor(sensor_id)) -> redSensorsData
+
+p <- ggplot(redSensorsData) +
+  geom_line(aes(x = timestamp, y = value, color = sensor_id)) +
+  ggpubr::color_palette(name = "sensor_id", palette = "jco") +
+  theme_bw() +
+  theme(legend.position = "top") + xlab("Zeit") + ylab("P1")
+plotly::ggplotly(p)
+```
+
+```{r, out.width="100%", out.height="75%", fig.width=8, fig.height=6, warning=FALSE, message=FALSE}
+dfScore %>% 
+  dplyr::filter(!Warnstufe %in% c("Rot", "Orange", "Gelb")) -> worstSensors
+
+p1Data %>% 
+  dplyr::filter(sensor_id %in% worstSensors$sensor_id) %>% 
+  dplyr::mutate(sensor_id = factor(sensor_id)) -> worstSensorsData
+
+worstSensorsData %>% 
+  group_by(timestamp) %>% 
+  summarise(mw = mean(value, na.rm=T),
+            sd = sd(value, na.rm = T),
+            median = median(value, na.rm=T),
+            iqr = IQR(value, na.rm=T)) -> aggP1Data
+
+pMean <- ggplot(aggP1Data) +
+  geom_line(data = redSensorsData,aes(x = timestamp, y = value, group = sensor_id), alpha = .25, color = "red3") +
+  geom_line(aes(x = timestamp, y = mw), color = "green") +
+  geom_ribbon(aes(x = timestamp, ymin = mw - sd, ymax = mw + sd), fill = "green", alpha = .25) +
+  theme_bw() +
+  theme(legend.position = "top") + xlab("Zeit") + ylab("P1") + ggtitle("Mittelwert aller grüner Sensoren +  Sensoren anderer Warnstufe")
+
+pMedian <- ggplot(aggP1Data) +
+  geom_line(data = redSensorsData,aes(x = timestamp, y = value, group = sensor_id), alpha = .25, color = "red3") +
+  geom_line(aes(x = timestamp, y = median), color = "green") +
+  geom_ribbon(aes(x = timestamp, ymin = median - iqr, ymax = median + iqr), fill = "green", alpha = .125) +
+  ylim(c(0, 200)) +
+  theme_bw() +
+  theme(legend.position = "top") + xlab("Zeit") + ylab("P1") + ggtitle("Median aller grüner Sensoren +  Sensoren anderer Warnstufe")
+
+plotly::subplot(pMean, pMedian)
+```
+
+Die Ergebnisse sehen soweit plausibel aus. Wie bereits oben beschrieben, ist das keine finales Resultat. Es wäre noch einiges an Detailarbeit zu erledigen.
+
