@@ -9,7 +9,7 @@ output:
     code_folding: show
     theme: readable
     highlight: tango
-    css: kable.css
+    css: css/kable.css
 ---
 
 ```{r setup, include=FALSE}
